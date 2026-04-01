@@ -1,0 +1,156 @@
+"""
+DataFlow AI - Orchestrator Agent
+Coordena todos os agentes do pipeline de dados.
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime
+from typing import Any
+from dataclasses import dataclass, field
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s → %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("Orchestrator")
+
+
+@dataclass
+class AgentResult:
+    agent_name: str
+    status: str  # success | failed | skipped
+    duration_sec: float
+    output: Any
+    error: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+@dataclass
+class PipelineContext:
+    run_id: str
+    source: str
+    results: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
+    started_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+class OrchestratorAgent:
+    """
+    Agente principal que coordena o pipeline completo de dados.
+    Responsável por: sequenciar agentes, tratar falhas, 
+    consolidar resultados e gerar relatório de execução.
+    """
+
+    def __init__(self):
+        self.name = "OrchestratorAgent"
+        self.pipeline_steps = [
+            "IngestionAgent",
+            "ValidationAgent",
+            "TransformationAgent",
+            "AnalysisAgent",
+            "ReportAgent",
+        ]
+        logger.info(f"[{self.name}] Inicializado com {len(self.pipeline_steps)} agentes")
+
+    async def run_agent(self, agent_name: str, context: PipelineContext) -> AgentResult:
+        """Executa um agente individual com tratamento de erro."""
+        from agents.ingestion_agent import IngestionAgent
+        from agents.validation_agent import ValidationAgent
+        from agents.transformation_agent import TransformationAgent
+        from agents.analysis_agent import AnalysisAgent
+        from agents.report_agent import ReportAgent
+
+        agent_map = {
+            "IngestionAgent": IngestionAgent,
+            "ValidationAgent": ValidationAgent,
+            "TransformationAgent": TransformationAgent,
+            "AnalysisAgent": AnalysisAgent,
+            "ReportAgent": ReportAgent,
+        }
+
+        logger.info(f"[{self.name}] ▶ Iniciando {agent_name}")
+        start = time.time()
+
+        try:
+            agent_class = agent_map[agent_name]
+            agent = agent_class()
+            output = await agent.run(context)
+            duration = round(time.time() - start, 2)
+
+            result = AgentResult(
+                agent_name=agent_name,
+                status="success",
+                duration_sec=duration,
+                output=output,
+            )
+            logger.info(f"[{self.name}] ✅ {agent_name} concluído em {duration}s")
+            return result
+
+        except Exception as e:
+            duration = round(time.time() - start, 2)
+            logger.error(f"[{self.name}] ❌ {agent_name} falhou: {e}")
+            return AgentResult(
+                agent_name=agent_name,
+                status="failed",
+                duration_sec=duration,
+                output=None,
+                error=str(e),
+            )
+
+    async def run_pipeline(self, source: str, run_id: str = None) -> PipelineContext:
+        """Executa o pipeline completo de forma sequencial."""
+        run_id = run_id or f"run_{int(time.time())}"
+        context = PipelineContext(run_id=run_id, source=source)
+
+        logger.info("=" * 60)
+        logger.info(f"[{self.name}] 🚀 Pipeline iniciado | run_id={run_id}")
+        logger.info(f"[{self.name}] 📁 Fonte: {source}")
+        logger.info("=" * 60)
+
+        for step in self.pipeline_steps:
+            result = await self.run_agent(step, context)
+            context.results[step] = result
+
+            # Interrompe pipeline se agente crítico falhar
+            if result.status == "failed" and step in ["IngestionAgent", "ValidationAgent"]:
+                logger.error(f"[{self.name}] 🛑 Pipeline interrompido — agente crítico falhou: {step}")
+                break
+
+        self._print_summary(context)
+        return context
+
+    def _print_summary(self, context: PipelineContext):
+        """Imprime resumo da execução do pipeline."""
+        total = len(context.results)
+        success = sum(1 for r in context.results.values() if r.status == "success")
+        failed = total - success
+        total_time = sum(r.duration_sec for r in context.results.values())
+
+        logger.info("=" * 60)
+        logger.info(f"[{self.name}] 📊 RESUMO DA EXECUÇÃO")
+        logger.info(f"[{self.name}] Run ID:   {context.run_id}")
+        logger.info(f"[{self.name}] Agentes:  {total} total | {success} ok | {failed} falhas")
+        logger.info(f"[{self.name}] Tempo:    {round(total_time, 2)}s total")
+        logger.info("=" * 60)
+
+        for name, result in context.results.items():
+            icon = "✅" if result.status == "success" else "❌"
+            logger.info(f"  {icon} {name:<25} {result.duration_sec}s")
+
+        logger.info("=" * 60)
+
+
+async def main():
+    orchestrator = OrchestratorAgent()
+    context = await orchestrator.run_pipeline(
+        source="data/raw/nyc_taxi_sample.parquet",
+        run_id="run_demo_001"
+    )
+    return context
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
