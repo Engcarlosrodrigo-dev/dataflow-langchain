@@ -1,0 +1,180 @@
+"""
+DataFlow AI - Transformation Agent
+Responsável por enriquecer e transformar os dados limpos.
+Feature engineering para análise e ML.
+"""
+
+import logging
+import asyncio
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+logger = logging.getLogger("TransformationAgent")
+
+
+class TransformationAgent:
+    """
+    Agente de Transformação e Feature Engineering.
+
+    Transformações aplicadas:
+    - Extração de features temporais (hora, dia, mês, turno)
+    - Cálculo de velocidade média da corrida
+    - Classificação de distância (curta/média/longa)
+    - Segmentação de passageiros
+    - Categorização de pagamento
+    - Normalização de valores monetários
+    - Criação de flag de gorjeta
+    - Agrupamentos geográficos por zona
+    """
+
+    def __init__(self):
+        self.name = "TransformationAgent"
+        self.features_created = []
+        logger.info(f"[{self.name}] Inicializado")
+
+    async def run(self, context) -> dict:
+        df = context.metadata.get("df_clean")
+        if df is None:
+            raise ValueError("DataFrame limpo não encontrado no contexto.")
+
+        logger.info(f"[{self.name}] ⚙️ Transformando {df.shape[0]:,} registros")
+        await asyncio.sleep(0.05)
+
+        df = self._extract_temporal_features(df)
+        df = self._calculate_trip_metrics(df)
+        df = self._classify_trip(df)
+        df = self._engineer_payment_features(df)
+        df = self._create_flags(df)
+
+        context.metadata["df_transformed"] = df
+        context.metadata["features"] = self.features_created
+
+        logger.info(f"[{self.name}] ✅ {len(self.features_created)} novas features criadas")
+        for f in self.features_created:
+            logger.info(f"[{self.name}]   + {f}")
+
+        return {
+            "features_created": len(self.features_created),
+            "feature_names": self.features_created,
+            "final_shape": df.shape,
+            "final_columns": list(df.columns),
+        }
+
+    def _extract_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extrai features de tempo do pickup."""
+        df["pickup_hour"] = df["tpep_pickup_datetime"].dt.hour
+        df["pickup_day_of_week"] = df["tpep_pickup_datetime"].dt.dayofweek
+        df["pickup_day_name"] = df["tpep_pickup_datetime"].dt.day_name()
+        df["pickup_month"] = df["tpep_pickup_datetime"].dt.month
+        df["pickup_month_name"] = df["tpep_pickup_datetime"].dt.month_name()
+        df["pickup_week"] = df["tpep_pickup_datetime"].dt.isocalendar().week.astype(int)
+        df["is_weekend"] = df["pickup_day_of_week"].isin([5, 6]).astype(int)
+
+        # Turno do dia
+        df["shift"] = pd.cut(
+            df["pickup_hour"],
+            bins=[-1, 5, 11, 17, 20, 23],
+            labels=["madrugada", "manha", "tarde", "noite", "noite_alta"]
+        )
+
+        new_features = [
+            "pickup_hour", "pickup_day_of_week", "pickup_day_name",
+            "pickup_month", "pickup_month_name", "pickup_week",
+            "is_weekend", "shift"
+        ]
+        self.features_created.extend(new_features)
+        logger.info(f"[{self.name}] Features temporais: {len(new_features)} criadas")
+        return df
+
+    def _calculate_trip_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calcula métricas derivadas da corrida."""
+        # Duração em minutos
+        df["trip_duration_min"] = (
+            (df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"])
+            .dt.total_seconds() / 60
+        ).round(2)
+
+        # Velocidade média (km/h) — convertendo milhas para km
+        df["trip_distance_km"] = (df["trip_distance"] * 1.60934).round(2)
+        df["avg_speed_kmh"] = np.where(
+            df["trip_duration_min"] > 0,
+            (df["trip_distance_km"] / (df["trip_duration_min"] / 60)).round(2),
+            0
+        )
+
+        # Receita por km
+        df["revenue_per_km"] = np.where(
+            df["trip_distance_km"] > 0,
+            (df["total_amount"] / df["trip_distance_km"]).round(2),
+            0
+        )
+
+        # Receita por minuto
+        df["revenue_per_min"] = np.where(
+            df["trip_duration_min"] > 0,
+            (df["total_amount"] / df["trip_duration_min"]).round(2),
+            0
+        )
+
+        new_features = [
+            "trip_duration_min", "trip_distance_km",
+            "avg_speed_kmh", "revenue_per_km", "revenue_per_min"
+        ]
+        self.features_created.extend(new_features)
+        logger.info(f"[{self.name}] Métricas de corrida: {len(new_features)} criadas")
+        return df
+
+    def _classify_trip(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Classifica corridas por distância e duração."""
+        df["distance_category"] = pd.cut(
+            df["trip_distance_km"],
+            bins=[0, 2, 5, 10, 20, float("inf")],
+            labels=["muito_curta", "curta", "media", "longa", "muito_longa"]
+        )
+
+        df["duration_category"] = pd.cut(
+            df["trip_duration_min"],
+            bins=[0, 5, 15, 30, 60, float("inf")],
+            labels=["rapida", "curta", "media", "longa", "muito_longa"]
+        )
+
+        new_features = ["distance_category", "duration_category"]
+        self.features_created.extend(new_features)
+        return df
+
+    def _engineer_payment_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Features relacionadas a pagamento."""
+        df["payment_label"] = df["payment_type"].map({
+            1: "cartao_credito",
+            2: "dinheiro",
+            3: "sem_cobranca",
+            4: "disputa"
+        }).fillna("outro")
+
+        df["tip_rate"] = np.where(
+            df["fare_amount"] > 0,
+            (df["tip_amount"] / df["fare_amount"] * 100).round(2),
+            0
+        )
+
+        df["has_toll"] = (df["tolls_amount"] > 0).astype(int)
+
+        new_features = ["payment_label", "tip_rate", "has_toll"]
+        self.features_created.extend(new_features)
+        return df
+
+    def _create_flags(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Cria flags binárias para segmentação."""
+        df["has_tip"] = (df["tip_amount"] > 0).astype(int)
+        df["is_shared"] = (df["passenger_count"] > 1).astype(int)
+        df["is_peak_hour"] = df["pickup_hour"].isin([7, 8, 9, 17, 18, 19]).astype(int)
+        df["is_late_night"] = df["pickup_hour"].isin([0, 1, 2, 3, 4]).astype(int)
+        df["is_airport_trip"] = df["PULocationID"].isin([1, 132, 138]).astype(int)
+
+        new_features = [
+            "has_tip", "is_shared", "is_peak_hour",
+            "is_late_night", "is_airport_trip"
+        ]
+        self.features_created.extend(new_features)
+        return df
