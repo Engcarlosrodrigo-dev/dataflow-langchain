@@ -1,0 +1,51 @@
+"""
+DataFlow AI — Multi-Agent Data Pipeline
+Ponto de entrada principal do sistema.
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from core.orchestrator import OrchestratorAgent
+
+
+async def main():
+    print("""
+╔══════════════════════════════════════════════════╗
+║        DataFlow AI — Multi-Agent Pipeline        ║
+║     Ingestão · Validação · Transformação         ║
+║        Análise · Relatório Automático            ║
+╚══════════════════════════════════════════════════╝
+    """)
+
+    orchestrator = OrchestratorAgent()
+    context = await orchestrator.run_pipeline(
+        source="data/raw/nyc_taxi_sample.parquet",
+        run_id="run_demo_001"
+    )
+
+    analysis = context.metadata.get("analysis", {})
+    kpis = analysis.get("kpis", {})
+
+    if kpis:
+        print("\n📊 RESULTADOS FINAIS:")
+        print(f"   Corridas processadas : {kpis['total_trips']:,}")
+        print(f"   Receita total        : ${kpis['total_revenue']:,.2f}")
+        print(f"   Ticket médio         : ${kpis['avg_ticket']:.2f}")
+        print(f"   Distância média      : {kpis['avg_distance_km']:.2f} km")
+        print(f"   % com gorjeta        : {kpis['tip_rate_pct']:.1f}%")
+        print(f"   Cartão de crédito    : {kpis['credit_card_pct']:.1f}%")
+
+    report_result = context.results.get("ReportAgent")
+    if report_result and report_result.status == "success":
+        print(f"\n📄 Relatório HTML gerado: {report_result.output['report_path']}")
+
+    print("\n✅ Pipeline concluído com sucesso!")
+    return context
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
