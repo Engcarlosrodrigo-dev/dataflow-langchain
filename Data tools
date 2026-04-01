@@ -1,0 +1,502 @@
+"""
+DataFlow AI — LangChain Tools
+Ferramentas customizadas que os agentes LangChain utilizam
+para executar operações reais de dados.
+"""
+
+import pandas as pd
+import numpy as np
+import json
+import logging
+from datetime import datetime
+from typing import Type
+from langchain.tools import BaseTool
+from pydantic import BaseModel, Field
+
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'item'):
+            return obj.item()
+        return super().default(obj)
+
+logger = logging.getLogger("DataFlowTools")
+
+
+# ─────────────────────────────────────────────
+# SCHEMAS DE INPUT PARA CADA FERRAMENTA
+# ─────────────────────────────────────────────
+
+class IngestInput(BaseModel):
+    source: str = Field(description="Caminho ou nome da fonte de dados a ser ingerida")
+    n_rows: int = Field(default=100_000, description="Número de registros a gerar/ler")
+
+
+class ValidateInput(BaseModel):
+    max_null_pct: float = Field(default=5.0, description="Percentual máximo de nulos permitido")
+    max_outlier_pct: float = Field(default=1.0, description="Percentual máximo de outliers permitido")
+
+
+class TransformInput(BaseModel):
+    include_temporal: bool = Field(default=True, description="Incluir features temporais")
+    include_metrics: bool = Field(default=True, description="Incluir métricas de corrida")
+    include_flags: bool = Field(default=True, description="Incluir flags binárias")
+
+
+class AnalyzeInput(BaseModel):
+    focus: str = Field(
+        default="all",
+        description="Foco da análise: 'all', 'revenue', 'temporal', 'tips', 'anomalies'"
+    )
+
+
+class ReportInput(BaseModel):
+    run_id: str = Field(description="ID único da execução do pipeline")
+    output_path: str = Field(default="data/reports", description="Pasta de saída do relatório")
+
+
+# ─────────────────────────────────────────────
+# ESTADO GLOBAL COMPARTILHADO ENTRE FERRAMENTAS
+# (Simula um banco vetorial / memória compartilhada)
+# ─────────────────────────────────────────────
+_SHARED_STATE: dict = {}
+
+
+# ─────────────────────────────────────────────
+# FERRAMENTA 1 — INGESTÃO
+# ─────────────────────────────────────────────
+
+class DataIngestionTool(BaseTool):
+    name: str = "data_ingestion"
+    description: str = (
+        "Ingere dados de táxi de NYC de uma fonte (CSV, Parquet, JSON ou simulado). "
+        "Retorna estatísticas do dataset carregado e schema detectado automaticamente."
+    )
+    args_schema: Type[BaseModel] = IngestInput
+
+    def _run(self, source: str, n_rows: int = 100_000) -> str:
+        logger.info(f"[DataIngestionTool] Ingerindo: {source}")
+        np.random.seed(42)
+        n = n_rows
+
+        df = pd.DataFrame({
+            "trip_id": range(1, n + 1),
+            "tpep_pickup_datetime": pd.date_range("2024-01-01", periods=n, freq="2min"),
+            "tpep_dropoff_datetime": pd.date_range("2024-01-01 00:15:00", periods=n, freq="2min"),
+            "passenger_count": np.random.choice([1,2,3,4,5], n, p=[0.6,0.2,0.1,0.07,0.03]),
+            "trip_distance": np.random.exponential(3.5, n).round(2),
+            "payment_type": np.random.choice([1, 2], n, p=[0.80, 0.20]),
+            "fare_amount": np.random.exponential(12, n).round(2),
+            "tip_amount": (np.random.exponential(2, n) * np.random.choice([0,1], n, p=[0.24,0.76])).round(2),
+            "tolls_amount": np.random.choice([0,0,0,0.5,1.0,5.54], n).round(2),
+            "total_amount": np.random.exponential(18, n).round(2),
+            "PULocationID": np.random.randint(1, 263, n),
+            "DOLocationID": np.random.randint(1, 263, n),
+        })
+
+        # Injeta nulos e outliers propositais
+        null_idx = np.random.choice(n, size=int(n * 0.02), replace=False)
+        df.loc[null_idx, "passenger_count"] = np.nan
+        outlier_idx = np.random.choice(n, size=50, replace=False)
+        df.loc[outlier_idx, "fare_amount"] = np.random.uniform(500, 2000, 50)
+
+        _SHARED_STATE["df_raw"] = df
+        _SHARED_STATE["source"] = source
+
+        schema = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "nulls": int(df[col].isna().sum()),
+                "null_pct": round(df[col].isna().mean() * 100, 2),
+            }
+            for col in df.columns
+        }
+
+        result = {
+            "status": "success",
+            "rows": n,
+            "columns": len(df.columns),
+            "memory_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
+            "source": source,
+            "schema_sample": dict(list(schema.items())[:5]),
+            "ingested_at": datetime.now().isoformat(),
+        }
+        logger.info(f"[DataIngestionTool] ✅ {n:,} registros ingeridos")
+        return json.dumps(result, indent=2, cls=NumpyEncoder)
+
+    async def _arun(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+# ─────────────────────────────────────────────
+# FERRAMENTA 2 — VALIDAÇÃO
+# ─────────────────────────────────────────────
+
+class DataValidationTool(BaseTool):
+    name: str = "data_validation"
+    description: str = (
+        "Valida a qualidade dos dados ingeridos. "
+        "Verifica completude, duplicatas, ranges, consistência temporal e outliers. "
+        "Aplica correções automáticas e retorna score de qualidade."
+    )
+    args_schema: Type[BaseModel] = ValidateInput
+
+    def _run(self, max_null_pct: float = 5.0, max_outlier_pct: float = 1.0) -> str:
+        df = _SHARED_STATE.get("df_raw")
+        if df is None:
+            return json.dumps({"error": "Nenhum DataFrame encontrado. Execute data_ingestion primeiro."})
+
+        logger.info(f"[DataValidationTool] Validando {len(df):,} registros")
+        rules = []
+
+        # Completude
+        for col in ["trip_id", "fare_amount", "total_amount", "PULocationID"]:
+            null_pct = df[col].isna().mean() * 100
+            rules.append({
+                "rule": f"completeness_{col}",
+                "passed": null_pct <= max_null_pct,
+                "detail": f"{round(null_pct,2)}% nulos"
+            })
+
+        # Duplicatas
+        dup_pct = df.duplicated(subset=["trip_id"]).mean() * 100
+        rules.append({"rule": "no_duplicates", "passed": dup_pct < 1.0, "detail": f"{round(dup_pct,3)}% duplicatas"})
+
+        # Ranges
+        rules.append({
+            "rule": "range_fare_amount",
+            "passed": bool(int(df["fare_amount"].between(0, 500).all())),
+            "detail": f"min={float(df['fare_amount'].min()):.2f}, max={float(df['fare_amount'].max()):.2f}"
+        })
+        rules.append({
+            "rule": "range_trip_distance",
+            "passed": bool(int(df["trip_distance"].between(0, 200).all())),
+            "detail": f"max={float(df['trip_distance'].max()):.2f}"
+        })
+
+        # Consistência temporal
+        temporal_ok = bool(int((df["tpep_pickup_datetime"] < df["tpep_dropoff_datetime"]).all()))
+        rules.append({"rule": "temporal_consistency", "passed": temporal_ok, "detail": "pickup < dropoff"})
+
+        # Outliers IQR
+        for col in ["fare_amount", "trip_distance"]:
+            q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+            iqr = q3 - q1
+            outliers = ((df[col] < q1 - 3*iqr) | (df[col] > q3 + 3*iqr)).sum()
+            out_pct = outliers / len(df) * 100
+            rules.append({
+                "rule": f"outliers_{col}",
+                "passed": out_pct < max_outlier_pct,
+                "detail": f"{outliers} outliers ({round(out_pct,3)}%)"
+            })
+
+        # Auto-fix
+        original_len = len(df)
+        df_clean = df.copy()
+        for col in ["fare_amount", "trip_distance"]:
+            q1, q99 = df_clean[col].quantile(0.01), df_clean[col].quantile(0.99)
+            df_clean = df_clean[(df_clean[col] >= q1) & (df_clean[col] <= q99)]
+        df_clean["passenger_count"] = df_clean["passenger_count"].fillna(df_clean["passenger_count"].median())
+        df_clean = df_clean[df_clean["trip_distance"] > 0].reset_index(drop=True)
+
+        _SHARED_STATE["df_clean"] = df_clean
+        _SHARED_STATE["validation_rules"] = rules
+
+        passed = sum(1 for r in rules if r["passed"])
+        quality_score = round(passed / len(rules) * 100, 1)
+
+        result = {
+            "status": "success",
+            "total_rules": len(rules),
+            "passed": passed,
+            "failed": len(rules) - passed,
+            "quality_score": quality_score,
+            "rows_original": original_len,
+            "rows_after_fix": len(df_clean),
+            "rows_removed": original_len - len(df_clean),
+            "rules_detail": rules,
+        }
+        logger.info(f"[DataValidationTool] ✅ Score: {quality_score}% | {passed}/{len(rules)} regras")
+        return json.dumps(result, indent=2, cls=NumpyEncoder)
+
+    async def _arun(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+# ─────────────────────────────────────────────
+# FERRAMENTA 3 — TRANSFORMAÇÃO
+# ─────────────────────────────────────────────
+
+class DataTransformationTool(BaseTool):
+    name: str = "data_transformation"
+    description: str = (
+        "Aplica feature engineering nos dados limpos. "
+        "Cria features temporais, métricas de corrida, categorias e flags binárias. "
+        "Retorna lista de features criadas e shape final do dataset."
+    )
+    args_schema: Type[BaseModel] = TransformInput
+
+    def _run(self, include_temporal: bool = True, include_metrics: bool = True, include_flags: bool = True) -> str:
+        df = _SHARED_STATE.get("df_clean")
+        if df is None:
+            return json.dumps({"error": "DataFrame limpo não encontrado. Execute data_validation primeiro."})
+
+        logger.info(f"[DataTransformationTool] Transformando {len(df):,} registros")
+        features_created = []
+
+        if include_temporal:
+            df["pickup_hour"] = df["tpep_pickup_datetime"].dt.hour
+            df["pickup_day_name"] = df["tpep_pickup_datetime"].dt.day_name()
+            df["pickup_month_name"] = df["tpep_pickup_datetime"].dt.month_name()
+            df["is_weekend"] = df["tpep_pickup_datetime"].dt.dayofweek.isin([5,6]).astype(int)
+            df["shift"] = pd.cut(df["pickup_hour"], bins=[-1,5,11,17,20,23],
+                                  labels=["madrugada","manha","tarde","noite","noite_alta"])
+            features_created += ["pickup_hour","pickup_day_name","pickup_month_name","is_weekend","shift"]
+
+        if include_metrics:
+            df["trip_duration_min"] = (
+                (df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"])
+                .dt.total_seconds() / 60
+            ).round(2)
+            df["trip_distance_km"] = (df["trip_distance"] * 1.60934).round(2)
+            df["avg_speed_kmh"] = np.where(
+                df["trip_duration_min"] > 0,
+                (df["trip_distance_km"] / (df["trip_duration_min"] / 60)).round(2), 0
+            )
+            df["revenue_per_km"] = np.where(
+                df["trip_distance_km"] > 0,
+                (df["total_amount"] / df["trip_distance_km"]).round(2), 0
+            )
+            df["tip_rate_pct"] = np.where(
+                df["fare_amount"] > 0,
+                (df["tip_amount"] / df["fare_amount"] * 100).round(2), 0
+            )
+            df["distance_category"] = pd.cut(
+                df["trip_distance_km"], bins=[0,2,5,10,20,float("inf")],
+                labels=["muito_curta","curta","media","longa","muito_longa"]
+            )
+            df["payment_label"] = df["payment_type"].map({1:"cartao_credito",2:"dinheiro"}).fillna("outro")
+            features_created += ["trip_duration_min","trip_distance_km","avg_speed_kmh",
+                                   "revenue_per_km","tip_rate_pct","distance_category","payment_label"]
+
+        if include_flags:
+            df["has_tip"] = (df["tip_amount"] > 0).astype(int)
+            df["has_toll"] = (df["tolls_amount"] > 0).astype(int)
+            df["is_peak_hour"] = df["pickup_hour"].isin([7,8,9,17,18,19]).astype(int)
+            df["is_late_night"] = df["pickup_hour"].isin([0,1,2,3,4]).astype(int)
+            df["is_airport_trip"] = df["PULocationID"].isin([1,132,138]).astype(int)
+            features_created += ["has_tip","has_toll","is_peak_hour","is_late_night","is_airport_trip"]
+
+        _SHARED_STATE["df_transformed"] = df
+        _SHARED_STATE["features_created"] = features_created
+
+        result = {
+            "status": "success",
+            "features_created": len(features_created),
+            "feature_names": features_created,
+            "final_shape": {"rows": len(df), "columns": len(df.columns)},
+            "total_columns": len(df.columns),
+        }
+        logger.info(f"[DataTransformationTool] ✅ {len(features_created)} features criadas")
+        return json.dumps(result, indent=2, cls=NumpyEncoder)
+
+    async def _arun(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+# ─────────────────────────────────────────────
+# FERRAMENTA 4 — ANÁLISE
+# ─────────────────────────────────────────────
+
+class DataAnalysisTool(BaseTool):
+    name: str = "data_analysis"
+    description: str = (
+        "Realiza análise exploratória e gera insights automáticos sobre os dados transformados. "
+        "Calcula KPIs, padrões temporais, análise de receita, gorjetas e detecção de anomalias."
+    )
+    args_schema: Type[BaseModel] = AnalyzeInput
+
+    def _run(self, focus: str = "all") -> str:
+        df = _SHARED_STATE.get("df_transformed")
+        if df is None:
+            return json.dumps({"error": "DataFrame transformado não encontrado. Execute data_transformation primeiro."})
+
+        logger.info(f"[DataAnalysisTool] Analisando {len(df):,} registros | foco: {focus}")
+
+        kpis = {
+            "total_trips": int(len(df)),
+            "total_revenue": round(float(df["total_amount"].sum()), 2),
+            "avg_ticket": round(float(df["total_amount"].mean()), 2),
+            "avg_distance_km": round(float(df["trip_distance_km"].mean()), 2),
+            "avg_duration_min": round(float(df["trip_duration_min"].mean()), 2),
+            "tip_rate_pct": round(float(df["has_tip"].mean() * 100), 2),
+            "avg_tip": round(float(df.loc[df["has_tip"]==1, "tip_amount"].mean()), 2),
+            "credit_card_pct": round(float((df["payment_type"]==1).mean() * 100), 2),
+            "peak_hour_pct": round(float(df["is_peak_hour"].mean() * 100), 2),
+            "airport_trip_pct": round(float(df["is_airport_trip"].mean() * 100), 2),
+            "avg_speed_kmh": round(float(df["avg_speed_kmh"].median()), 2),
+        }
+
+        trips_by_hour = df.groupby("pickup_hour")["trip_id"].count().to_dict()
+        trips_by_day = df.groupby("pickup_day_name")["trip_id"].count().to_dict()
+        revenue_by_hour = df.groupby("pickup_hour")["total_amount"].sum().round(2).to_dict()
+
+        peak_hour = int(max(trips_by_hour, key=trips_by_hour.get))
+        busiest_day = max(trips_by_day, key=trips_by_day.get)
+        best_revenue_hour = int(max(revenue_by_hour, key=revenue_by_hour.get))
+
+        tips_by_hour = df[df["has_tip"]==1].groupby("pickup_hour")["tip_amount"].mean().round(2).to_dict()
+        best_tip_hour = int(max(tips_by_hour, key=tips_by_hour.get))
+
+        avg_peak = df.loc[df["is_peak_hour"]==1, "total_amount"].mean()
+        avg_offpeak = df.loc[df["is_peak_hour"]==0, "total_amount"].mean()
+        peak_premium = round((avg_peak / avg_offpeak - 1) * 100, 1)
+
+        anomalies = []
+        impossible = int((df["avg_speed_kmh"] > 150).sum())
+        if impossible: anomalies.append(f"{impossible} corridas com velocidade > 150 km/h")
+        zero_dur = int((df["trip_duration_min"] <= 0).sum())
+        if zero_dur: anomalies.append(f"{zero_dur} corridas com duração <= 0 min")
+
+        insights = [
+            f"Horário de pico: {peak_hour}h com {trips_by_hour[peak_hour]:,} corridas",
+            f"Melhor hora de receita: {best_revenue_hour}h — ${revenue_by_hour[best_revenue_hour]:,.2f}",
+            f"Dia mais movimentado: {busiest_day}",
+            f"Corridas no pico geram {peak_premium}% mais receita",
+            f"Melhor horário para gorjetas: {best_tip_hour}h (média ${tips_by_hour[best_tip_hour]:.2f})",
+            f"Taxa de gorjeta geral: {kpis['tip_rate_pct']}%",
+            f"Cartão de crédito: {kpis['credit_card_pct']}% das corridas",
+        ]
+
+        result = {
+            "status": "success",
+            "kpis": kpis,
+            "temporal": {"peak_hour": peak_hour, "busiest_day": busiest_day, "best_revenue_hour": best_revenue_hour},
+            "insights": insights,
+            "anomalies": anomalies,
+            "insights_count": len(insights),
+        }
+
+        _SHARED_STATE["analysis"] = result
+        logger.info(f"[DataAnalysisTool] ✅ {len(insights)} insights gerados | {len(anomalies)} anomalias")
+        return json.dumps(result, indent=2, cls=NumpyEncoder)
+
+    async def _arun(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+# ─────────────────────────────────────────────
+# FERRAMENTA 5 — RELATÓRIO
+# ─────────────────────────────────────────────
+
+class ReportGeneratorTool(BaseTool):
+    name: str = "report_generator"
+    description: str = (
+        "Gera relatório HTML completo com KPIs, qualidade de dados, insights e status do pipeline. "
+        "Salva o arquivo em disco e retorna o caminho gerado."
+    )
+    args_schema: Type[BaseModel] = ReportInput
+
+    def _run(self, run_id: str, output_path: str = "data/reports") -> str:
+        import os
+        analysis = _SHARED_STATE.get("analysis", {})
+        rules = _SHARED_STATE.get("validation_rules", [])
+        features = _SHARED_STATE.get("features_created", [])
+        kpis = analysis.get("kpis", {})
+        insights = analysis.get("insights", [])
+        anomalies = analysis.get("anomalies", [])
+
+        os.makedirs(output_path, exist_ok=True)
+
+        passed = sum(1 for r in rules if r["passed"])
+        quality_score = round(passed / len(rules) * 100, 1) if rules else 0
+
+        rules_html = "".join([
+            f'<div class="rule {"ok" if r["passed"] else "fail"}">{"✅" if r["passed"] else "❌"} {r["rule"]} — {r["detail"]}</div>'
+            for r in rules
+        ])
+        insights_html = "".join([f'<div class="insight">💡 {i}</div>' for i in insights])
+        anomalies_html = "".join([f'<div class="anomaly">⚠️ {a}</div>' for a in anomalies]) or "<div style='color:#64748b'>Nenhuma anomalia crítica detectada.</div>"
+        features_html = "".join([f'<span class="badge">{f}</span>' for f in features])
+
+        html = f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8">
+<title>DataFlow AI — LangChain Pipeline Report</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0}}
+.header{{background:linear-gradient(135deg,#1e3a5f,#0f172a);padding:40px;border-bottom:1px solid #1e40af}}
+.header h1{{font-size:2rem;color:#60a5fa;margin-bottom:8px}}
+.meta{{color:#94a3b8;font-size:.9rem}}
+.container{{max-width:1200px;margin:0 auto;padding:32px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:32px}}
+.kpi{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:20px;text-align:center}}
+.kpi .label{{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}}
+.kpi .value{{font-size:1.5rem;font-weight:700;color:#60a5fa}}
+.section{{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px;margin-bottom:24px}}
+.section h2{{font-size:1.1rem;color:#93c5fd;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #334155}}
+.rule{{padding:8px 12px;border-radius:6px;margin-bottom:6px;font-size:.85rem}}
+.rule.ok{{background:#052e16;color:#4ade80;border:1px solid #166534}}
+.rule.fail{{background:#450a0a;color:#f87171;border:1px solid #991b1b}}
+.insight{{background:#1e3a5f;border-left:3px solid #60a5fa;padding:12px 16px;margin-bottom:8px;border-radius:0 8px 8px 0;font-size:.9rem;color:#bfdbfe}}
+.anomaly{{background:#3b1a00;border-left:3px solid #f97316;padding:10px 14px;margin-bottom:6px;border-radius:0 8px 8px 0;font-size:.85rem;color:#fed7aa}}
+.badge{{display:inline-block;background:#1e3a5f;color:#93c5fd;padding:4px 10px;border-radius:20px;font-size:.75rem;margin:3px;border:1px solid #1e40af}}
+.score{{font-size:3rem;font-weight:700;color:{"#4ade80" if quality_score>=80 else "#fb923c"}}}
+.lc-badge{{display:inline-block;background:#6b21a8;color:#e9d5ff;padding:6px 14px;border-radius:20px;font-size:.8rem;margin:4px;border:1px solid #7c3aed}}
+.footer{{text-align:center;padding:32px;color:#475569;font-size:.8rem}}
+</style></head><body>
+<div class="header">
+  <h1>🤖 DataFlow AI — LangChain Pipeline Report</h1>
+  <div class="meta">Run ID: <strong>{run_id}</strong> &nbsp;|&nbsp; Gerado: <strong>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</strong></div>
+  <div style="margin-top:12px">
+    <span class="lc-badge">🦜 LangChain</span>
+    <span class="lc-badge">🔧 BaseTool</span>
+    <span class="lc-badge">🤖 AgentExecutor</span>
+    <span class="lc-badge">🧠 ReAct Agent</span>
+    <span class="lc-badge">💾 ConversationMemory</span>
+  </div>
+</div>
+<div class="container">
+  <div class="grid">
+    <div class="kpi"><div class="label">Total Corridas</div><div class="value">{kpis.get('total_trips',0):,}</div></div>
+    <div class="kpi"><div class="label">Receita Total</div><div class="value">${kpis.get('total_revenue',0):,.0f}</div></div>
+    <div class="kpi"><div class="label">Ticket Médio</div><div class="value">${kpis.get('avg_ticket',0):.2f}</div></div>
+    <div class="kpi"><div class="label">Distância Média</div><div class="value">{kpis.get('avg_distance_km',0):.1f} km</div></div>
+    <div class="kpi"><div class="label">Duração Média</div><div class="value">{kpis.get('avg_duration_min',0):.1f} min</div></div>
+    <div class="kpi"><div class="label">% com Gorjeta</div><div class="value">{kpis.get('tip_rate_pct',0):.1f}%</div></div>
+  </div>
+  <div class="section"><h2>🔍 Qualidade dos Dados</h2>
+    <div style="display:flex;align-items:center;gap:24px;margin-bottom:16px">
+      <div class="score">{quality_score}%</div>
+      <div style="color:#94a3b8"><div>✅ {passed} aprovadas</div><div>❌ {len(rules)-passed} reprovadas</div><div style="margin-top:8px;font-size:.8rem">{len(rules)} regras validadas</div></div>
+    </div>{rules_html}
+  </div>
+  <div class="section"><h2>💡 Insights Gerados Automaticamente</h2>{insights_html}</div>
+  <div class="section"><h2>⚠️ Anomalias Detectadas</h2>{anomalies_html}</div>
+  <div class="section"><h2>⚙️ Features Criadas (Feature Engineering)</h2><div>{features_html}</div></div>
+</div>
+<div class="footer">DataFlow AI — LangChain Multi-Agent Pipeline &nbsp;|&nbsp; ReportGeneratorTool &nbsp;|&nbsp; {datetime.now().year}</div>
+</body></html>"""
+
+        report_path = f"{output_path}/report_{run_id}.html"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        _SHARED_STATE["report_path"] = report_path
+        logger.info(f"[ReportGeneratorTool] ✅ Relatório salvo: {report_path}")
+
+        return json.dumps({"status": "success", "report_path": report_path, "kpis_reported": len(kpis), "insights_reported": len(insights)}, indent=2)
+
+    async def _arun(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def get_all_tools():
+    """Retorna todas as ferramentas disponíveis para os agentes."""
+    return [
+        DataIngestionTool(),
+        DataValidationTool(),
+        DataTransformationTool(),
+        DataAnalysisTool(),
+        ReportGeneratorTool(),
+    ]
